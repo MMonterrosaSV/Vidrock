@@ -232,12 +232,12 @@ async function resolve(raw) {
 app.get('/', (_req, res) => {
   res.type('text').send(
     `Vidrock resolver\n\n` +
-      `Redirect to m3u8:\n  GET /resolve?url=tt4154796\n\n` +
+      `Redirect to Worker proxy:\n  GET /resolve?url=tt4154796\n\n` +
       `Full JSON:\n  GET /resolve/raw?url=tt4154796\n`
   )
 })
 
-// 302 redirect to the best master.m3u8
+// 302 → https://vod.mmonterrosa970.workers.dev/?proxy=<master.m3u8>
 app.get('/resolve', async (req, res) => {
   try {
     const raw = (req.query.url || '').toString().trim()
@@ -249,13 +249,13 @@ app.get('/resolve', async (req, res) => {
       return res.status(404).type('text').send(note || 'No playable sources')
     }
 
-    res.redirect(302, sources[0].url)
+    const target = sources[0].proxyUrl || `${WORKER}/?proxy=${encodeURIComponent(sources[0].url)}`
+    res.redirect(302, target)
   } catch (e) {
     res.status(e.status || 502).type('text').send(e.message)
   }
 })
 
-// Full JSON
 app.get('/resolve/raw', async (req, res) => {
   try {
     const raw = (req.query.url || '').toString().trim()
