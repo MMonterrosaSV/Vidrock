@@ -15,6 +15,161 @@ const AES_KEY = Buffer.from(
 const TMDB_KEY = process.env.TMDB_KEY || '1f54bd990f1cdfb230adb312546d765d'
 const WORKER = (process.env.WORKER_ORIGIN || 'https://vod.mmonterrosa970.workers.dev').replace(/\/$/, '')
 
+// ─── GitHub list storage ─────────────────────────────────────────────────────
+// Stores lines like:  tt4154796 : https://cdn.../master.m3u8
+// Files: resolved-movies  |  resolved-tvshows
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || ''
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'MMonterrosaSV'
+const GITHUB_REPO = process.env.GITHUB_REPO || 'Vidrock'
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main'
+const GH_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents`
+
+// In-process map so we don't hit GitHub on every request while the process is warm
+const memoryCache = new Map() // key → { m3u8, kind, target, at }
+
+function listFileFor(kind) {
+  return kind === 'tv' ? 'resolved-tvshows' : 'resolved-movies'
+}
+
+function cacheKey(raw) {
+  return raw.trim().toLowerCase()
+}
+
+/** Parse a list file body into Map<id, m3u8> */
+function parseListBody(text) {
+  const map = new Map()
+  if (!text) return map
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    // formats accepted:
+    //   tt4154796 : https://...
+    //   tt4154796|https://...
+    //   tt4154796=https://...
+    const m = trimmed.match(/^(\S+)\s*[|:=]\s*(https?:\/\/\S+)/i)
+    if (m) map.set(m[1].toLowerCase(), m[2])
+  }
+  return map
+}
+
+/** Fetch current file content + sha from GitHub */
+async function githubGetFile(path) {
+  if (!GITHUB_TOKEN) return { content: '', sha: null, map: new Map() }
+  const res = await fetch(`${GH_API}/${path}?ref=${GITHUB_BRANCH}`, {
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'vidrock-resolver',
+    },
+  })
+  if (res.status === 404) return { content: '', sha: null, map: new Map() }
+  if (!res.ok) {
+    const t = await res.text()
+    console.warn(`[github] GET ${path} → ${res.status}: ${t.slice(0, 200)}`)
+    return { content: '', sha: null, map: new Map() }
+  }
+  const data = await res.json()
+  const content = Buffer.from(data.content || '', 'base64').toString('utf8')
+  return { content, sha: data.sha, map: parseListBody(content) }
+}
+
+/** Append or update one line in the list file and commit */
+async function githubSaveEntry(kind, id, m3u8) {
+  if (!GITHUB_TOKEN) {
+    console.warn('[github] GITHUB_TOKEN not set — skipping persist')
+    return false
+  }
+  const path = listFileFor(kind)
+  const key = id.toLowerCase()
+  const line = `${id} : ${m3u8}`
+
+  try {
+    const { content, sha, map } = await githubGetFile(path)
+
+    // already present with same URL → nothing to do
+    if (map.get(key) === m3u8) return true
+
+    // rebuild body: keep other lines, replace or append this id
+    const lines = content
+      .split('\n')
+      .map((l) => l.trimEnd())
+      .filter((l) => {
+        if (!l.trim()) return false
+        const m = l.match(/^(\S+)\s*[|:=]/)
+        return !(m && m[1].toLowerCase() === key)
+      })
+    lines.push(line)
+    const newBody = lines.join('\n') + '\n'
+
+    const body = {
+      message: `cache: ${kind} ${id}`,
+      content: Buffer.from(newBody, 'utf8').toString('base64'),
+      branch: GITHUB_BRANCH,
+    }
+    if (sha) body.sha = sha
+
+    const res = await fetch(`${GH_API}/${path}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'vidrock-resolver',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    })
+
+    if (!res.ok) {
+      const t = await res.text()
+      console.warn(`[github] PUT ${path} → ${res.status}: ${t.slice(0, 300)}`)
+      return false
+    }
+    console.log(`[github] saved ${kind} ${id}`)
+    return true
+  } catch (e) {
+    console.warn(`[github] save failed: ${e.message}`)
+    return false
+  }
+}
+
+/** Look up m3u8 for a raw id (checks memory then GitHub list) */
+async function lookupCached(raw, kindHint) {
+  const key = cacheKey(raw)
+  const mem = memoryCache.get(key)
+  if (mem?.m3u8) return mem
+
+  // try both lists if kind unknown, otherwise the matching one first
+  const files =
+    kindHint === 'tv'
+      ? ['resolved-tvshows', 'resolved-movies']
+      : kindHint === 'movie'
+        ? ['resolved-movies', 'resolved-tvshows']
+        : ['resolved-movies', 'resolved-tvshows']
+
+  for (const path of files) {
+    const { map } = await githubGetFile(path)
+    const m3u8 = map.get(key)
+    if (m3u8) {
+      const kind = path.includes('tv') ? 'tv' : 'movie'
+      const target = `${WORKER}/?proxy=${encodeURIComponent(m3u8)}`
+      const entry = { m3u8, kind, target, at: Date.now() }
+      memoryCache.set(key, entry)
+      return entry
+    }
+  }
+  return null
+}
+
+function setMemory(raw, m3u8, kind) {
+  const key = cacheKey(raw)
+  const target = `${WORKER}/?proxy=${encodeURIComponent(m3u8)}`
+  memoryCache.set(key, { m3u8, kind, target, at: Date.now() })
+}
+
+// ─── Crypto / helpers (unchanged) ────────────────────────────────────────────
+
 function base64UrlToBuf(input) {
   let b64 = input.replace(/-/g, '+').replace(/_/g, '/')
   const pad = b64.length % 4
@@ -112,6 +267,9 @@ function parseInput(raw) {
   if (/^\d+$/.test(raw)) return { kind: 'movie', id: raw, needResolve: false }
   m = raw.match(/^(\d+)\/(\d+)\/(\d+)$/)
   if (m) return { kind: 'tv', id: m[1], season: +m[2], episode: +m[3], needResolve: false }
+  // TV with IMDB + season/episode: tt1234567/1/2
+  m = raw.match(/^(tt\d+)\/(\d+)\/(\d+)$/i)
+  if (m) return { kind: 'tv', id: m[1], season: +m[2], episode: +m[3], needResolve: true }
   return null
 }
 
@@ -229,27 +387,74 @@ async function resolve(raw) {
   return { parsed, sources }
 }
 
+/** Stable id string used as the list key */
+function listId(raw, parsed) {
+  // Prefer the original query string so lookups match what the user typed
+  const base = raw.trim()
+  if (parsed.kind === 'tv' && parsed.season != null && parsed.episode != null) {
+    // also ensure TV keys include season/episode when the raw was only an id
+    if (!/\d+\/\d+$/.test(base) && !/\/\d+\/\d+$/.test(base)) {
+      return `${base}/${parsed.season}/${parsed.episode}`
+    }
+  }
+  return base
+}
+
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
 app.get('/', (_req, res) => {
   res.type('text').send(
     `Vidrock resolver\n\n` +
       `Redirect to Worker proxy:\n  GET /resolve?url=tt4154796\n\n` +
-      `Full JSON:\n  GET /resolve/raw?url=tt4154796\n`
+      `Full JSON:\n  GET /resolve/raw?url=tt4154796\n\n` +
+      `Cache (GitHub lists):\n  GET /cache\n`
   )
 })
 
-// 302 → https://vod.mmonterrosa970.workers.dev/?proxy=<master.m3u8>
+app.get('/cache', async (_req, res) => {
+  const movies = await githubGetFile('resolved-movies')
+  const tv = await githubGetFile('resolved-tvshows')
+  res.json({
+    githubTokenSet: Boolean(GITHUB_TOKEN),
+    memorySize: memoryCache.size,
+    movies: Object.fromEntries(movies.map),
+    tvshows: Object.fromEntries(tv.map),
+  })
+})
+
 app.get('/resolve', async (req, res) => {
   try {
     const raw = (req.query.url || '').toString().trim()
     if (!raw) return res.status(400).type('text').send('Missing ?url=')
 
-    const { sources, note } = await resolve(raw)
+    // 1) Fast path: memory or GitHub list
+    const hint = parseInput(raw)?.kind
+    const cached = await lookupCached(raw, hint)
+    if (cached?.target) {
+      console.log(`[cache hit] ${raw}`)
+      return res.redirect(302, cached.target)
+    }
+
+    // 2) Full resolve
+    const { sources, note, parsed } = await resolve(raw)
 
     if (!sources.length) {
       return res.status(404).type('text').send(note || 'No playable sources')
     }
 
-    const target = sources[0].proxyUrl || `${WORKER}/?proxy=${encodeURIComponent(sources[0].url)}`
+    const best = sources[0]
+    const m3u8 = best.url
+    const target = best.proxyUrl || `${WORKER}/?proxy=${encodeURIComponent(m3u8)}`
+    const id = listId(raw, parsed)
+
+    // 3) Persist to GitHub list + memory
+    setMemory(raw, m3u8, parsed.kind)
+    // also key by the normalized list id
+    if (cacheKey(id) !== cacheKey(raw)) setMemory(id, m3u8, parsed.kind)
+
+    // fire-and-forget save (don't block the redirect)
+    githubSaveEntry(parsed.kind, id, m3u8).catch(() => {})
+
     res.redirect(302, target)
   } catch (e) {
     res.status(e.status || 502).type('text').send(e.message)
@@ -260,6 +465,18 @@ app.get('/resolve/raw', async (req, res) => {
   try {
     const raw = (req.query.url || '').toString().trim()
     if (!raw) return res.status(400).json({ error: 'Missing ?url=' })
+
+    const hint = parseInput(raw)?.kind
+    const cached = await lookupCached(raw, hint)
+    if (cached?.m3u8) {
+      console.log(`[cache hit raw] ${raw}`)
+      return res.json({
+        cached: true,
+        m3u8: cached.m3u8,
+        proxyUrl: cached.target,
+        kind: cached.kind,
+      })
+    }
 
     const { parsed, sources, note } = await resolve(raw)
 
@@ -272,7 +489,15 @@ app.get('/resolve/raw', async (req, res) => {
     }
 
     const best = sources[0]
+    const m3u8 = best.url
+    const id = listId(raw, parsed)
+
+    setMemory(raw, m3u8, parsed.kind)
+    if (cacheKey(id) !== cacheKey(raw)) setMemory(id, m3u8, parsed.kind)
+    githubSaveEntry(parsed.kind, id, m3u8).catch(() => {})
+
     res.json({
+      cached: false,
       tmdbId: parsed.id,
       kind: parsed.kind,
       season: parsed.season || null,
@@ -293,4 +518,5 @@ app.get('/resolve/raw', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`listening on 0.0.0.0:${PORT}`)
+  console.log(`GitHub persist: ${GITHUB_TOKEN ? 'enabled' : 'DISABLED (set GITHUB_TOKEN)'}`)
 })
