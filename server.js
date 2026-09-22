@@ -192,7 +192,6 @@ async function resolve(raw) {
     try {
       const url = decryptUrl(entry.url)
       if (isDecoyHost(url)) continue
-      // Only full master playlists
       if (!/master\.m3u8/i.test(url)) continue
       candidates.push({
         name,
@@ -232,11 +231,32 @@ async function resolve(raw) {
 
 app.get('/', (_req, res) => {
   res.type('text').send(
-    `Vidrock resolver\n\nGET /resolve?url=157336\nGET /resolve?url=tt0816692\n`
+    `Vidrock resolver\n\n` +
+      `Plain m3u8 only:\n  GET /resolve?url=tt4154796\n\n` +
+      `Full JSON:\n  GET /resolve/raw?url=tt4154796\n`
   )
 })
 
+// Plain text: only the best master.m3u8 URL
 app.get('/resolve', async (req, res) => {
+  try {
+    const raw = (req.query.url || '').toString().trim()
+    if (!raw) return res.status(400).type('text').send('Missing ?url=')
+
+    const { sources, note } = await resolve(raw)
+
+    if (!sources.length) {
+      return res.status(404).type('text').send(note || 'No playable sources')
+    }
+
+    res.type('text').send(sources[0].url)
+  } catch (e) {
+    res.status(e.status || 502).type('text').send(e.message)
+  }
+})
+
+// Full JSON (what you were seeing before)
+app.get('/resolve/raw', async (req, res) => {
   try {
     const raw = (req.query.url || '').toString().trim()
     if (!raw) return res.status(400).json({ error: 'Missing ?url=' })
