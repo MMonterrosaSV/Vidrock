@@ -192,7 +192,8 @@ async function resolve(raw) {
     try {
       const url = decryptUrl(entry.url)
       if (isDecoyHost(url)) continue
-      if (!/\.m3u8(\?|$)/i.test(url) && entry.type !== 'hls') continue
+      // Only full master playlists
+      if (!/master\.m3u8/i.test(url)) continue
       candidates.push({
         name,
         url,
@@ -206,7 +207,7 @@ async function resolve(raw) {
   }
 
   if (!candidates.length) {
-    return { parsed, sources: [], note: 'No decryptable / non-decoy sources' }
+    return { parsed, sources: [], note: 'No master.m3u8 sources found' }
   }
 
   const scored = await Promise.all(
@@ -270,4 +271,6 @@ app.get('/resolve', async (req, res) => {
   }
 })
 
-app.listen(PORT, () => console.log(`listening on ${PORT}`))
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`listening on 0.0.0.0:${PORT}`)
+})
