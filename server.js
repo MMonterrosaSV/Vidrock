@@ -15,7 +15,6 @@ const AES_KEY = Buffer.from(
 const TMDB_KEY = process.env.TMDB_KEY || '1f54bd990f1cdfb230adb312546d765d'
 const WORKER = (process.env.WORKER_ORIGIN || 'https://vod.mmonterrosa970.workers.dev').replace(/\/$/, '')
 
-// ---------- crypto (same as site) ----------
 function base64UrlToBuf(input) {
   let b64 = input.replace(/-/g, '+').replace(/_/g, '/')
   const pad = b64.length % 4
@@ -39,14 +38,9 @@ function decryptUrl(ciphertext) {
 
 function isDecoyHost(url) {
   const u = url.toLowerCase()
-  return (
-    u.includes('b-cdn.net') ||
-    u.includes('bunnycdn') ||
-    u.includes('mediadelivery.net')
-  )
+  return u.includes('b-cdn.net') || u.includes('bunnycdn') || u.includes('mediadelivery.net')
 }
 
-// ---------- duration probe (light: one playlist fetch) ----------
 async function playlistDurationSec(m3u8Url) {
   try {
     const res = await fetch(m3u8Url, {
@@ -61,20 +55,16 @@ async function playlistDurationSec(m3u8Url) {
     if (!res.ok) return 0
     const text = await res.text()
 
-    // Master playlist → pick first media playlist and recurse once
     if (text.includes('#EXT-X-STREAM-INF')) {
-      const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
-      let mediaUrl = null
+      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
           const next = lines[i + 1]
           if (next && !next.startsWith('#')) {
-            mediaUrl = new URL(next, m3u8Url).href
-            break
+            return playlistDurationSec(new URL(next, m3u8Url).href)
           }
         }
       }
-      if (mediaUrl) return playlistDurationSec(mediaUrl)
       return 0
     }
 
@@ -97,7 +87,6 @@ function formatDuration(sec) {
   return `${h}h ${m}m ${s}s`
 }
 
-// ---------- id parsing ----------
 async function imdbToTmdb(imdbId) {
   const res = await fetch(
     `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_KEY}&external_source=imdb_id`
@@ -126,7 +115,6 @@ function parseInput(raw) {
   return null
 }
 
-// ---------- Playwright: CF bypass + in-page API fetch ----------
 async function fetchCatalogViaPlaywright(apiPath) {
   const browser = await chromium.launch({
     headless: true,
@@ -146,21 +134,17 @@ async function fetchCatalogViaPlaywright(apiPath) {
     })
     const page = await context.newPage()
 
-    // Land on site so CF challenge can complete
     await page.goto(VIDROCK + '/', {
       waitUntil: 'domcontentloaded',
       timeout: 60000,
     })
-    // Give JS challenge a moment
     await page.waitForTimeout(3000)
 
-    // If still on challenge, wait a bit more
     const title = await page.title()
     if (/just a moment/i.test(title)) {
       await page.waitForTimeout(5000)
     }
 
-    // Fetch API inside the browser (has clearance cookies)
     const result = await page.evaluate(async (path) => {
       const r = await fetch('https://vidrock.net/api/' + path, {
         credentials: 'include',
@@ -177,13 +161,7 @@ async function fetchCatalogViaPlaywright(apiPath) {
       throw new Error(`vidrock API ${result.status}: ${result.text.slice(0, 200)}`)
     }
 
-    let payload
-    try {
-      payload = JSON.parse(result.text)
-    } catch {
-      throw new Error('API returned non-JSON (CF still blocking?)')
-    }
-    return payload
+    return JSON.parse(result.text)
   } finally {
     await browser.close()
   }
@@ -208,7 +186,6 @@ async function resolve(raw) {
 
   const payload = await fetchCatalogViaPlaywright(apiPath)
 
-  // Decrypt all usable entries
   const candidates = []
   for (const [name, entry] of Object.entries(payload || {})) {
     if (!entry || typeof entry !== 'object' || !entry.url) continue
@@ -232,7 +209,6 @@ async function resolve(raw) {
     return { parsed, sources: [], note: 'No decryptable / non-decoy sources' }
   }
 
-  // Probe duration in parallel (capped)
   const scored = await Promise.all(
     candidates.map(async (c) => {
       const durationSec = c.format === 'hls' ? await playlistDurationSec(c.url) : 0
@@ -246,10 +222,7 @@ async function resolve(raw) {
     })
   )
 
-  // Longest first; treat unknown duration as 0
   scored.sort((a, b) => (b.durationSec || 0) - (a.durationSec || 0))
-
-  // Prefer “hours long” when available (>= 30 min)
   const longOnes = scored.filter((s) => (s.durationSec || 0) >= 30 * 60)
   const sources = longOnes.length ? longOnes : scored
 
@@ -258,10 +231,7 @@ async function resolve(raw) {
 
 app.get('/', (_req, res) => {
   res.type('text').send(
-    `Vidrock resolver (Playwright)\n\n` +
-      `GET /resolve?url=157336\n` +
-      `GET /resolve?url=tt0816692\n` +
-      `GET /resolve?url=https://vidrock.net/movie/tt0816692\n`
+    `Vidrock resolver\n\nGET /resolve?url=157336\nGET /resolve?url=tt0816692\n`
   )
 })
 
@@ -280,9 +250,7 @@ app.get('/resolve', async (req, res) => {
       })
     }
 
-    // Best = longest (already sorted)
     const best = sources[0]
-
     res.json({
       tmdbId: parsed.id,
       kind: parsed.kind,
@@ -298,9 +266,7 @@ app.get('/resolve', async (req, res) => {
       sources,
     })
   } catch (e) {
-    res.status(e.status || 502).json({
-      error: e.message,
-    })
+    res.status(e.status || 502).json({ error: e.message })
   }
 })
 
